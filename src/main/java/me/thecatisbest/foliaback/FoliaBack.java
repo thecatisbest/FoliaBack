@@ -1,181 +1,132 @@
 package me.thecatisbest.foliaback;
 
-import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.entity.EnderPearl;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityToggleGlideEvent;
-import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
-import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffectType;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 
 public class FoliaBack extends JavaPlugin implements Listener {
 
-    // 单 tick 内认为“瞬间跳跃”的距离阈值（可根据需要调整）
-    private static final double TELEPORT_THRESHOLD = 5.0;
-    private static final long MONITORING_DURATION = 100L;
-    // 如果玩家在此毫秒数内投掷过珍珠，则认为是珍珠传送，取消监控（可根据需要调整）
-    private static final long PEARL_IGNORE_THRESHOLD_MS = 10000;
-
-    private final Map<UUID, ScheduledTask> monitoringTasks = new HashMap<>();
-    private final Map<UUID, Location> lastTeleportLocation = new HashMap<>();
-    // 存储玩家上次投掷珍珠的时间
-    private final Map<UUID, Long> lastPearlThrowTime = new HashMap<>();
+    // 記錄上一次的位置（非落體時的 tick 位置）
+    private final ConcurrentHashMap<UUID, Location> lastTickLocations = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Location> backLocations = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Long> teleportFlags = new ConcurrentHashMap<>();
+    private static final long TELEPORT_IGNORE_THRESHOLD = 10000L;
 
     @Override
     public void onEnable() {
-        getServer().getPluginManager().registerEvents(this, this);
+        Bukkit.getPluginManager().registerEvents(this, this);
 
         getCommand("foliaback").setExecutor((sender, cmd, label, args) -> {
             if (sender instanceof Player player) {
-                Location lastLoc = getLastTeleportLocation(player);
-
-                if (lastLoc == null) {
+                UUID uuid = player.getUniqueId();
+                Location lastLocation = backLocations.get(uuid);
+                if (lastLocation == null) {
                     player.sendMessage("§c你沒有最近的傳送記錄！");
                     return true;
                 }
-
-                player.teleportAsync(lastLoc);
+                player.teleportAsync(lastLocation);
                 player.sendMessage("§f已傳送回上一個位置！");
                 return true;
             }
             return false;
         });
-    }
 
-    private void cancelMonitoring(UUID uuid) {
-        if (monitoringTasks.containsKey(uuid)) {
-            monitoringTasks.get(uuid).cancel();
-            monitoringTasks.remove(uuid);
-        }
-    }
+        // 每 50 毫秒（約 1 tick）執行一次偵測任務
+        getServer().getAsyncScheduler().runAtFixedRate(this, task -> {
+            long currentTime = System.currentTimeMillis();
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                UUID uuid = player.getUniqueId();
+                Location currentLocation = player.getLocation();
 
-    @EventHandler
-    public void onPlayerCommand(PlayerCommandPreprocessEvent event) {
-        Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
+                if (player.isGliding() || hasMovementAffectingPotion(player) || teleportRecently(uuid, currentTime)
+                        || player.isFlying() || player.getGameMode() == GameMode.SPECTATOR) {
+                    // 更新記錄（因這些情況不參與偵測）
+                    lastTickLocations.put(uuid, currentLocation);
+                    continue;
+                }
 
-        cancelMonitoring(uuid);
-
-        Location initialLocation = player.getLocation().clone();
-        MonitoringData data = new MonitoringData(initialLocation, player.getFallDistance());
-
-        ScheduledTask task = getServer().getGlobalRegionScheduler().runAtFixedRate(this, (ScheduledTask scheduledTask) -> {
-            data.ticks++;
-
-            // 检查玩家是否在短时间内投掷了终界珍珠
-            Long pearlTime = lastPearlThrowTime.get(uuid);
-            if (pearlTime != null && System.currentTimeMillis() - pearlTime < PEARL_IGNORE_THRESHOLD_MS) {
-                scheduledTask.cancel();
-                monitoringTasks.remove(uuid);
-                return;
-            }
-
-            if (player.isGliding() || player.isFlying()) {
-                scheduledTask.cancel();
-                monitoringTasks.remove(uuid);
-                return;
-            }
-
-            Location currentLocation = player.getLocation();
-            double distance = currentLocation.distance(data.previousLocation);
-
-            if (distance >= TELEPORT_THRESHOLD) {
-                // 计算水平位移
-                double deltaX = currentLocation.getX() - data.previousLocation.getX();
-                double deltaZ = currentLocation.getZ() - data.previousLocation.getZ();
-                double horizontal = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
-
-                // 如果水平位移明显，则判断为传送
-                if (horizontal >= 1.0) {
-                    lastTeleportLocation.put(uuid, initialLocation);
-                    scheduledTask.cancel();
-                    monitoringTasks.remove(uuid);
-                    return;
-                } else {
-                    // 如果水平位移不明显，则可能是纯垂直变化（正常下落）
-                    // 正常下落时，fallDistance 应该持续增加；
-                    // 如果突然下降（例如从较大落距降为较小值）且玩家未着地，则可能是传送（垂直传送）
-                    double currentFall = player.getFallDistance();
-                    if (currentFall < data.previousFallDistance && data.previousFallDistance >= 1.0 && !player.isOnGround()) {
-                        lastTeleportLocation.put(uuid, initialLocation);
-                        scheduledTask.cancel();
-                        monitoringTasks.remove(uuid);
-                        return;
+                // 如果之前有記錄，則偵測本 tick 與上一次記錄的位移
+                if (lastTickLocations.containsKey(uuid)) {
+                    Location previous = lastTickLocations.get(uuid);
+                    if (previous != null && previous.getWorld() != null && currentLocation.getWorld() != null
+                            && previous.getWorld().equals(currentLocation.getWorld())) {
+                        double tickDistance = previous.distance(currentLocation);
+                        if (tickDistance > 5) {
+                            double dx = currentLocation.getX() - previous.getX();
+                            double dz = currentLocation.getZ() - previous.getZ();
+                            double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+                            double verticalDifference = Math.abs(currentLocation.getY() - previous.getY());
+                            // 如果主要是垂直位移（水平位移很小），視為高空落下，此時不更新記錄
+                            if (horizontalDistance < 1.0 && verticalDifference > 5) {
+                                lastTickLocations.put(uuid, currentLocation);
+                                continue;
+                            } else {
+                                // 非落體的異常移動，記錄上一次的位置供傳送使用
+                                backLocations.put(uuid, previous);
+                                player.sendMessage("§b已記錄傳送點");
+                                player.sendMessage("X: " + previous.getX() + ", Y: " + previous.getY() + ", Z: " + previous.getZ());
+                            }
+                        }
                     }
                 }
+                // 更新記錄（僅在非落體情況更新）
+                lastTickLocations.put(uuid, currentLocation);
             }
-
-            data.previousLocation = currentLocation;
-            data.previousFallDistance = player.getFallDistance();
-
-            if (data.ticks >= MONITORING_DURATION) {
-                scheduledTask.cancel();
-                monitoringTasks.remove(uuid);
-            }
-        }, 2L, 1L);
-        monitoringTasks.put(uuid, task);
+        }, 50L, 50L, TimeUnit.MILLISECONDS);
     }
 
-    @EventHandler
-    public void onPlayerDeath(PlayerDeathEvent event) {
-        Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
-        Location initialLocation = player.getLocation().clone();
-        lastTeleportLocation.put(uuid, initialLocation);
+    @Override
+    public void onDisable() {
+        lastTickLocations.clear();
+        backLocations.clear();
+        teleportFlags.clear();
+    }
+
+    private boolean hasMovementAffectingPotion(Player player) {
+        return player.hasPotionEffect(PotionEffectType.SPEED) || player.hasPotionEffect(PotionEffectType.LEVITATION);
+    }
+
+    // 判斷玩家是否在近期因傳送而觸發大幅位移
+    private boolean teleportRecently(UUID uuid, long currentTime) {
+        if (teleportFlags.containsKey(uuid)) {
+            long teleportTime = teleportFlags.get(uuid);
+            if (currentTime - teleportTime < TELEPORT_IGNORE_THRESHOLD) {
+                return true;
+            } else {
+                teleportFlags.remove(uuid);
+            }
+        }
+        return false;
     }
 
     @EventHandler
     public void onProjectileLaunch(ProjectileLaunchEvent event) {
         if (event.getEntity() instanceof EnderPearl) {
-            if (event.getEntity().getShooter() instanceof Player player) {
-                UUID uuid = player.getUniqueId();
-                lastPearlThrowTime.put(uuid, System.currentTimeMillis());
-                cancelMonitoring(uuid);
+            Object shooter = event.getEntity().getShooter();
+            if (shooter instanceof Player player) {
+                teleportFlags.put(player.getUniqueId(), System.currentTimeMillis());
             }
         }
     }
 
     @EventHandler
-    public void onItemConsume(PlayerItemConsumeEvent event) {
+    public void onPlayerItemConsume(PlayerItemConsumeEvent event) {
         if (event.getItem().getType() == Material.CHORUS_FRUIT) {
-            cancelMonitoring(event.getPlayer().getUniqueId());
-        }
-    }
-
-    @EventHandler
-    public void onToggleGlide(EntityToggleGlideEvent event) {
-        if (event.getEntity() instanceof Player player) {
-            if (event.isGliding()) {
-                cancelMonitoring(player.getUniqueId());
-            }
-        }
-    }
-
-    public Location getLastTeleportLocation(Player player) {
-        return lastTeleportLocation.get(player.getUniqueId());
-    }
-
-    /**
-     * 辅助类，用于在监控任务中保存上一次位置和已运行的 tick 数
-     */
-    private static class MonitoringData {
-        long ticks = 0;
-        Location previousLocation;
-        double previousFallDistance;
-
-        MonitoringData(Location initialLocation, double initialFallDistance) {
-            this.previousLocation = initialLocation;
-            this.previousFallDistance = initialFallDistance;
+            Player player = event.getPlayer();
+            teleportFlags.put(player.getUniqueId(), System.currentTimeMillis());
         }
     }
 }
