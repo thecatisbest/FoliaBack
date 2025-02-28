@@ -52,7 +52,7 @@ public class FoliaBack extends JavaPlugin implements Listener {
                 Location currentLocation = player.getLocation();
 
                 if (player.isGliding() || hasMovementAffectingPotion(player) || teleportRecently(uuid, currentTime)
-                        || player.isFlying() || player.getGameMode() == GameMode.SPECTATOR) {
+                        || player.isFlying() || player.getGameMode() == GameMode.SPECTATOR || player.getVehicle() != null) {
                     // 更新記錄（因這些情況不參與偵測）
                     lastTickLocations.put(uuid, currentLocation);
                     continue;
