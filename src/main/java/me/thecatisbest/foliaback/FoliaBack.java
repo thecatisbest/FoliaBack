@@ -64,7 +64,7 @@ public class FoliaBack extends JavaPlugin implements Listener {
                     if (previous != null && previous.getWorld() != null && currentLocation.getWorld() != null
                             && previous.getWorld().equals(currentLocation.getWorld())) {
                         double tickDistance = previous.distance(currentLocation);
-                        if (tickDistance > 5) {
+                        if (tickDistance > 8) {
                             double dx = currentLocation.getX() - previous.getX();
                             double dz = currentLocation.getZ() - previous.getZ();
                             double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
